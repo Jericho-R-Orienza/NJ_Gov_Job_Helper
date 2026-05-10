@@ -216,6 +216,21 @@ def _scrape_with_playwright(url: str, dept_name: str) -> tuple[list[Job], str]:
         return [], "tier3"
 
 
+def _fetch_static(url: str) -> requests.Response | None:
+    """GET a URL, retrying without SSL verification if the cert check fails."""
+    try:
+        return requests.get(url, headers=HEADERS, timeout=15)
+    except requests.exceptions.SSLError:
+        try:
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            return requests.get(url, headers=HEADERS, timeout=15, verify=False)
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
 def scrape_dept(url: str, dept_name: str) -> DeptResult:
     """Scrape a single department URL. Tries tier1 → tier2 → tier3 in order."""
     # Check for known APIs first
@@ -223,15 +238,14 @@ def scrape_dept(url: str, dept_name: str) -> DeptResult:
     if api_jobs is not None:
         return DeptResult(name=dept_name, url=url, tier="tier1", jobs=api_jobs)
 
-    # Try static HTTP
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        if resp.status_code in (401, 403, 407, 404):
-            return DeptResult(name=dept_name, url=url, tier="tier3")
-        if resp.status_code != 200:
-            return DeptResult(name=dept_name, url=url, tier="tier3")
-    except Exception:
-        return DeptResult(name=dept_name, url=url, tier="tier3")
+    # Try static HTTP (with SSL retry)
+    resp = _fetch_static(url)
+
+    if resp is None or resp.status_code not in range(200, 300):
+        # HTTP failed entirely — give playwright a shot before declaring Tier 3
+        print(" [HTTP failed, trying playwright]", end=" ", flush=True)
+        jobs, tier = _scrape_with_playwright(url, dept_name)
+        return DeptResult(name=dept_name, url=url, tier=tier, jobs=jobs)
 
     soup = BeautifulSoup(resp.text, "html.parser")
     page_text = soup.get_text(strip=True)
@@ -244,6 +258,23 @@ def scrape_dept(url: str, dept_name: str) -> DeptResult:
 
     jobs = _extract_jobs_from_soup(soup, url, dept_name)
     return DeptResult(name=dept_name, url=url, tier="tier1", jobs=jobs)
+
+
+# The NJ CSC directory page has stale links for some departments.
+# These are the confirmed working replacements.
+_URL_CORRECTIONS = {
+    # Old URL pattern (substring)          : correct URL
+    "mvc/About/employ":                      "https://www.nj.gov/mvc/about/employ.htm",
+    "njcourts.gov/public/jobs":             "https://www.njcourts.gov/careers",
+    "/sci/home/employment":                  "https://www.nj.gov/sci/employment/",
+}
+
+
+def _apply_url_corrections(url: str) -> str:
+    for pattern, replacement in _URL_CORRECTIONS.items():
+        if pattern in url:
+            return replacement
+    return url
 
 
 def scrape_all() -> tuple[list[Job], list[DeptResult]]:
@@ -263,7 +294,7 @@ def scrape_all() -> tuple[list[Job], list[DeptResult]]:
 
     for i, dept in enumerate(departments, 1):
         name = dept["name"]
-        url = dept["url"]
+        url = _apply_url_corrections(dept["url"])
         print(f"[{i:>2}/{len(departments)}] {name[:55]:<55}", end=" ", flush=True)
 
         result = scrape_dept(url, name)
